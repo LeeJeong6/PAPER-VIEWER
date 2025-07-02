@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>PDF 좌우 분할 뷰어 + 번역기</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 0; padding: 20px;
+      background: #f8f8f8;
+      user-select: text;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    #controls {
+      margin-bottom: 10px;
+    }
+
+    #viewer-container {
+      display: flex;
+      flex-grow: 1;
+      border: 1px solid #ccc;
+      background: white;
+      overflow: hidden;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      border-radius: 6px;
+    }
+
+    #canvas-container, #text-container {
+      flex: 1;
+      padding: 10px;
+      overflow-y: auto;
+    }
+
+    #canvas-container {
+      border-right: 1px solid #ddd;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+    }
+
+    canvas {
+      border: 1px solid #aaa;
+      max-width: 100%;
+      height: auto;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      background: #fff;
+    }
+
+    #text-container {
+      white-space: pre-wrap;
+      font-size: 16px;
+      line-height: 1.4;
+      color: #333;
+      user-select: text;
+    }
+
+    #tooltip {
+      position: absolute;
+      background: #fff;
+      border: 1px solid #333;
+      padding: 5px 8px;
+      display: none;
+      z-index: 20000;
+      font-size: 0.95rem;
+      border-radius: 3px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      max-width: 200px;
+      word-break: break-word;
+    }
+
+    #vocab-box {
+      position: fixed;
+      right: 20px;
+      top: 20px;
+      width: 280px;
+      background: #fff;
+      border: 1px solid #ddd;
+      padding: 1rem;
+      font-size: 0.95rem;
+      box-shadow: 0 0 8px rgba(0,0,0,0.1);
+      border-radius: 6px;
+      max-height: 80vh;
+      overflow-y: auto;
+      z-index: 10000;
+    }
+
+    button {
+      margin-right: 0.5rem;
+      padding: 0.3rem 0.8rem;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <h2> PDF 뷰어 + 번역기</h2>
+
+  <div id="controls">
+    <input type="file" id="file-input" accept=".pdf" />
+    <button id="prevPage" disabled>이전 페이지</button>
+    <button id="nextPage" disabled>다음 페이지</button>
+    <span>페이지: <span id="page_num">0</span> / <span id="page_count">0</span></span>
+  </div>
+
+  <div id="viewer-container">
+    <div id="canvas-container"></div>
+    <div id="text-container"></div>
+  </div>
+
+  <div id="tooltip"></div>
+
+  <div id="vocab-box">
+    <h3> 번역한 단어</h3>
+    <ul id="word-list"></ul>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('file-input');
+    const canvasContainer = document.getElementById('canvas-container');
+    const textContainer = document.getElementById('text-container');
+    const tooltip = document.getElementById('tooltip');
+    const wordList = document.getElementById('word-list');
+    const prevPageBtn = document.getElementById('prevPage');
+    const nextPageBtn = document.getElementById('nextPage');
+    const pageNumSpan = document.getElementById('page_num');
+    const pageCountSpan = document.getElementById('page_count');
+
+    let pdfDoc = null;
+    let currentPage = 1;
+    let totalPages = 0;
+    const scale = 1.5;
+
+    // 저장된 단어 불러오기
+    let savedWords = JSON.parse(localStorage.getItem('translatedWords') || '[]');
+    savedWords.forEach(entry => {
+      const li = document.createElement('li');
+      li.textContent = entry;
+      wordList.appendChild(li);
+    });
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file || file.type !== 'application/pdf') {
+        alert('PDF 파일을 선택해주세요');
+        return;
+      }
+
+      const arrayBuffer = await file.arrayBuffer();
+
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      pdfDoc = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+
+      totalPages = pdfDoc.numPages;
+      currentPage = 1;
+      pageCountSpan.textContent = totalPages;
+      pageNumSpan.textContent = currentPage;
+
+      prevPageBtn.disabled = false;
+      nextPageBtn.disabled = false;
+
+      await renderPage(currentPage);
+    });
+
+    async function renderPage(pageNum) {
+  canvasContainer.innerHTML = '';
+  textContainer.innerHTML = '';
+  tooltip.style.display = 'none';
+
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale });
+
+  // --- 캔버스 렌더링 (왼쪽) ---
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  canvasContainer.appendChild(canvas);
+  await page.render({canvasContext: ctx, viewport: viewport}).promise;
+
+  // --- 텍스트 추출 및 줄단위 그룹화 ---
+  const textContent = await page.getTextContent();
+  const items = textContent.items;
+
+  // y좌표로 그룹화: 같은 y 좌표(약간의 오차 포함)면 같은 줄
+  const lines = [];
+  const epsilon = 2; // 허용 오차 px
+
+  items.forEach(item => {
+    // transform 배열에서 y 위치 추출 (기본 pdf.js 텍스트 좌표 체계)
+    const y = item.transform[5];
+
+    // 기존 라인 중 y좌표와 비슷한 라인 찾기
+    let line = lines.find(l => Math.abs(l.y - y) < epsilon);
+    if (!line) {
+      line = { y: y, items: [] };
+      lines.push(line);
+    }
+    line.items.push(item);
+  });
+
+  // y좌표 역순으로 정렬 (pdf 좌표계는 아래가 0이라 숫자가 작을수록 위쪽)
+  lines.sort((a, b) => b.y - a.y);
+
+  // 줄별 아이템을 x좌표 기준 정렬 후, 각 아이템 텍스트 연결
+  let pageText = '';
+  lines.forEach(line => {
+    line.items.sort((a, b) => a.transform[4] - b.transform[4]); // x 좌표 기준 정렬
+    // 들여쓰기 구현 (첫 아이템 x 좌표에 따라 스페이스 삽입)
+    const indentSpaces = Math.floor(line.items[0].transform[4] / 7); // 적당히 스페이스 개수 계산
+    pageText += ' '.repeat(indentSpaces);
+    pageText += line.items.map(i => i.str).join(' ') + '\n';
+  });
+
+  textContainer.textContent = pageText;
+}
+
+
+    prevPageBtn.addEventListener('click', () => {
+      if (currentPage <= 1) return;
+      currentPage--;
+      pageNumSpan.textContent = currentPage;
+      renderPage(currentPage);
+    });
+
+    nextPageBtn.addEventListener('click', () => {
+      if (currentPage >= totalPages) return;
+      currentPage++;
+      pageNumSpan.textContent = currentPage;
+      renderPage(currentPage);
+    });
+
+    // 번역 API 호출 및 단어장 저장
+    async function translateAndSave(word, mouseX, mouseY) {
+      try {
+        const res = await fetch('/translate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({word})
+        });
+        const data = await res.json();
+        const translated = data.translated;
+
+        const entry = `${word} → ${translated}`;
+
+        // 중복 검사
+        if (!savedWords.includes(entry)) {
+          savedWords.push(entry);
+          localStorage.setItem('translatedWords', JSON.stringify(savedWords));
+
+          const li = document.createElement('li');
+          li.textContent = entry;
+          wordList.appendChild(li);
+        }
+
+        // 툴팁 위치 조절 및 표시
+        tooltip.textContent = translated;
+        tooltip.style.left = mouseX + 'px';
+        tooltip.style.top = (mouseY + 20) + 'px';
+        tooltip.style.display = 'block';
+
+      } catch (err) {
+        alert('번역 실패했습니다.');
+      }
+    }
+
+    // 드래그 번역 처리 (텍스트 컨테이너 안에서만)
+    textContainer.addEventListener('mouseup', (e) => {
+      const selection = window.getSelection();
+      const text = selection.toString().trim();
+
+      if (text.length > 0) {
+        translateAndSave(text, e.pageX, e.pageY);
+        selection.removeAllRanges();
+      } else {
+        tooltip.style.display = 'none';
+      }
+    });
+
+    // 툴팁 클릭 시 숨기기
+    document.addEventListener('click', () => {
+      tooltip.style.display = 'none';
+    });
+  </script>
+
+</body>
+</html>
